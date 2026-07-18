@@ -1,6 +1,10 @@
 'use strict';
 
 const { APP_SCHEMA, ACTION_TYPES } = require('./app-schema');
+const { getRegistry } = require('./core-primitives');
+const { validateNodeAgainstDefinition } = require('../public/registry');
+const { buildPrimitive } = require('./synthesize-primitive');
+const store = require('./primitive-store');
 
 function parseEnabledWhen(value) {
   const text = String(value || '').trim();
@@ -116,7 +120,53 @@ function validateCondition(condition, stateKeys, where) {
   if (condition.operator !== undefined && !CONDITION_OPERATORS.has(condition.operator)) throw new Error(`${where} uses an unknown operator: ${condition.operator}`);
 }
 
-function validateReferences(app) {
+function findPrimitiveUsage(app, kind, id) {
+  if (kind === 'component') return (app.components || []).find(c => c.type === id) || null;
+  for (const rule of app.rules || []) for (const action of rule.actions || []) if (action.op === id) return action;
+  return null;
+}
+
+function describeGap(kind, id, usage) {
+  const fields = usage ? Object.keys(usage).filter(k => k !== 'type' && k !== 'op' && k !== 'id') : [];
+  return `Define a ${kind} primitive named "${id}". It is used with these fields: ${fields.join(', ') || '(none observed)'}. Infer sensible field types and, for an action, a pure reduce body that updates state accordingly.`;
+}
+
+function usedSynthesized(app, registry) {
+  const ids = new Set();
+  for (const c of app.components || []) { const d = registry.get(c.type); if (d && d.provenance === 'synthesized') ids.add(c.type); }
+  for (const r of app.rules || []) for (const a of r.actions || []) { const d = registry.get(a.op); if (d && d.provenance === 'synthesized') ids.add(a.op); }
+  return [...ids];
+}
+
+// Validate an app, and when it references a primitive the registry lacks, synthesize that
+// primitive (verified in the sandbox), register it, persist it, and retry — bounded so a
+// pathological spec can't loop forever. This is the "gap detected -> synthesize -> verify ->
+// register -> reuse" loop, wired into the real build path.
+async function validateWithSynthesis(app, registry = getRegistry(), maxGaps = 4) {
+  for (let attempt = 0; attempt <= maxGaps; attempt++) {
+    try {
+      validateReferences(app, registry);
+      const used = usedSynthesized(app, registry);
+      for (const id of used) store.recordUse(id);
+      app.primitives = used.map(id => registry.get(id));
+      return app;
+    } catch (err) {
+      const match = /Unknown (component|action) primitive: (\S+)/.exec(err.message || '');
+      if (!match || attempt === maxGaps) throw err;
+      const [, kind, id] = match;
+      const usage = findPrimitiveUsage(app, kind, id);
+      const def = await buildPrimitive(describeGap(kind, id, usage));
+      def.id = id; def.kind = kind; def.provenance = 'synthesized';
+      registry.register(def);
+      store.saveCandidate(def);
+    }
+  }
+  return app;
+}
+
+function validateReferences(app, registry = getRegistry()) {
+  const knownComponentTypes = new Set(registry.componentTypes());
+  const knownActionOps = new Set(registry.actionOps());
   if (!app || typeof app !== 'object' || Array.isArray(app)) throw new Error('The model returned an invalid application object');
   if (!app.state || typeof app.state !== 'object' || Array.isArray(app.state)) throw new Error('Application state is missing');
   if (!Array.isArray(app.components) || !app.components.length) throw new Error('Application components are missing');
@@ -130,6 +180,9 @@ function validateReferences(app) {
     if (!component.id || !component.type) throw new Error('Every component needs an id and type');
     if (componentIds.has(component.id)) throw new Error(`Duplicate component id: ${component.id}`);
     componentIds.add(component.id);
+    if (!knownComponentTypes.has(component.type)) throw new Error(`Unknown component primitive: ${component.type}`);
+    const compDef = registry.get(component.type);
+    if (compDef && compDef.fields) validateNodeAgainstDefinition(component, compDef, stateKeys, `Component ${component.id}`);
     if (component.bind && !stateKeys.has(component.bind)) throw new Error(`Unknown binding: ${component.bind}`);
     for (const field of ['indexState','itemIndexState']) if (component[field] && !stateKeys.has(component[field])) throw new Error(`Component ${component.id} references unknown state key: ${component[field]}`);
     for (const field of ['visibleWhen','hiddenWhen','enabledWhen','disabledWhen']) if (component[field] !== undefined) validateCondition(component[field], stateKeys, `Component ${component.id} ${field}`);
@@ -179,6 +232,9 @@ function validateReferences(app) {
     if (ruleEvents.has(rule.event)) throw new Error(`Duplicate rule event: ${rule.event}`);
     ruleEvents.add(rule.event);
     for (const action of rule.actions) {
+      if (!knownActionOps.has(action.op)) throw new Error(`Unknown action primitive: ${action.op}`);
+      const opDef = registry.get(action.op);
+      if (opDef && opDef.fields) { validateNodeAgainstDefinition(action, opDef, stateKeys, `Rule ${rule.event} action ${action.op}`); continue; }
       if (!stateKeys.has(action.target)) throw new Error(`Unknown action target: ${action.target}`);
       if (action.from && !stateKeys.has(action.from)) throw new Error(`Unknown action source: ${action.from}`);
       if (action.indexFrom && !stateKeys.has(action.indexFrom)) throw new Error(`Unknown index source: ${action.indexFrom}`);
@@ -211,6 +267,7 @@ async function buildApp(prompt, currentApp) {
   const instructions = [
     'You are the AtomOS application architect. Return only one complete application matching the supplied JSON schema.',
     editing ? 'Revise the current application and preserve unrelated working features and stable ids.' : 'Build one complete small interactive application.',
+    'Choose the simplest structure that satisfies the request. Compose ordinary applications from primitive components — heading, text, display, input, button, group, repeat, image and link — with state and rules providing all behaviour. Reach for board only when the request is a turn-based grid game, and for scene only when the request is a real-time game with movement or physics. Tools, forms, trackers, dashboards, calculators, quizzes, lists, feeds and websites need neither board nor scene. Never wrap a non-game application in a scene, and do not add a scene or board unless the user explicitly asked for that kind of game.',
     'Every button, board and repeat item event must have a matching rule. Every bind, condition and action target must name a state key.',
     'Interval enabledWhen accepts exactly one state key. Do not write JavaScript expressions such as a || b or a && b; create separate interval capabilities when different state keys should enable the same event.',
     'Use scene, not board, for real-time platformers, physics games, sprites, camera-follow worlds and tile-map levels. Scene bind must point to an entity-list state key. Use board only for clickable grid and turn-based games, and board bind must point to a flat list state key.',
@@ -228,8 +285,8 @@ async function buildApp(prompt, currentApp) {
   const text = extractOutputText(payload);
   if (!text) throw new Error('The model returned no application');
   const app = normalizeApplication(JSON.parse(text));
-  validateReferences(app);
+  await validateWithSynthesis(app);
   return { app, model, responseId: payload.id, mode: editing ? 'edit' : 'build', capabilities: app.capabilities.map(({ id, type }) => ({ id, type })) };
 }
 
-module.exports = { normalizeApplication, validateReferences, buildApp, APP_SCHEMA, ACTION_TYPES, parseEnabledWhen };
+module.exports = { normalizeApplication, validateReferences, validateWithSynthesis, buildApp, APP_SCHEMA, ACTION_TYPES, parseEnabledWhen };
