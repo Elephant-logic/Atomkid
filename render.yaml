@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: atomos-studio
+    runtime: node
+    plan: free
+    # Zero npm dependencies, so there's nothing to install and no need to run the
+    # test suite at deploy time (the tests spawn python3, which may not be present
+    # on Render's Node build image and would otherwise fail the build).
+    buildCommand: node -e "0"
+    startCommand: npm start
+    healthCheckPath: /api/status
+    autoDeployTrigger: commit
+    envVars:
+      - key: NODE_VERSION
+        value: 22
+      - key: OPENAI_MODEL
+        value: gpt-5-mini
+      # Secret: Render prompts you for this in the Dashboard on first creation.
+      # Never commit the actual key here.
+      - key: OPENAI_API_KEY
+        sync: false
